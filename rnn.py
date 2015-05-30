@@ -11,6 +11,7 @@ import time
 import os
 import datetime
 import cPickle as pickle
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ class RNN(object):
     softmax : single softmax out, use cross-entropy error
     """
     def __init__(self, input, n_in, n_hidden, n_out, activation=T.tanh,
-                 output_type='real', use_symbolic_softmax=False):
+                 output_type='real', only_output_after=False, use_symbolic_softmax=False):
 
         self.input = input
         self.activation = activation
@@ -49,9 +50,10 @@ class RNN(object):
             self.softmax = T.nnet.softmax
 
         # recurrent weights as a shared variable
-        W_init = np.asarray(np.random.uniform(size=(n_hidden, n_hidden),
+        ''' W_init = np.asarray(np.random.uniform(size=(n_hidden, n_hidden),
                                               low=-.01, high=.01),
-                                              dtype=theano.config.floatX)
+                                              dtype=theano.config.floatX)'''
+        W_init = np.identity(n_hidden, dtype=theano.config.floatX)
         self.W = theano.shared(value=W_init, name='W')
         # input to hidden layer weights
         W_in_init = np.asarray(np.random.uniform(size=(n_in, n_hidden),
@@ -99,6 +101,10 @@ class RNN(object):
         [self.h, self.y_pred], _ = theano.scan(step,
                                                sequences=self.input,
                                                outputs_info=[self.h0, None])
+
+        # sometimes we only care about the final output
+        if only_output_after:
+            self.y_pred = self.y_pred[-1]
 
         # L1 norm ; one regularization option is to enforce L1 norm to
         # be small
@@ -184,6 +190,8 @@ class MetaRNN(BaseEstimator):
                  activation='tanh', output_type='real',
                  final_momentum=0.9, initial_momentum=0.5,
                  momentum_switchover=5,
+                 grad_max=10,
+                 only_output_after=False,
                  use_symbolic_softmax=False):
         self.n_in = int(n_in)
         self.n_hidden = int(n_hidden)
@@ -199,6 +207,8 @@ class MetaRNN(BaseEstimator):
         self.final_momentum = float(final_momentum)
         self.momentum_switchover = int(momentum_switchover)
         self.use_symbolic_softmax = use_symbolic_softmax
+        self.only_output_after = only_output_after
+        self.grad_max = grad_max
 
         self.ready()
 
@@ -233,7 +243,8 @@ class MetaRNN(BaseEstimator):
         self.rnn = RNN(input=self.x, n_in=self.n_in,
                        n_hidden=self.n_hidden, n_out=self.n_out,
                        activation=activation, output_type=self.output_type,
-                       use_symbolic_softmax=self.use_symbolic_softmax)
+                       use_symbolic_softmax=self.use_symbolic_softmax,
+                       only_output_after=self.only_output_after)
 
         if self.output_type == 'real':
             self.predict = theano.function(inputs=[self.x, ],
@@ -367,12 +378,20 @@ class MetaRNN(BaseEstimator):
             + self.L1_reg * self.rnn.L1 \
             + self.L2_reg * self.rnn.L2_sqr
 
-        compute_train_error = theano.function(inputs=[index, ],
-                                              outputs=self.rnn.loss(self.y),
-                                              givens={
-                                                  self.x: train_set_x[index],
-                                                  self.y: train_set_y[index]},
-            mode=mode)
+        if self.output_type == 'softmax':
+            compute_train_error = theano.function(inputs=[index, ],
+                                          outputs=[self.rnn.loss(self.y), T.eq(self.rnn.y_out, self.y)],
+                                          givens={
+                                              self.x: train_set_x[index],
+                                              self.y: train_set_y[index]},
+        mode=mode)
+        else:
+            compute_train_error = theano.function(inputs=[index, ],
+                                          outputs=self.rnn.loss(self.y),
+                                          givens={
+                                              self.x: train_set_x[index],
+                                              self.y: train_set_y[index]},
+        mode=mode)
 
         if self.interactive:
             compute_test_error = theano.function(inputs=[index, ],
@@ -386,7 +405,7 @@ class MetaRNN(BaseEstimator):
         # gradients on the weights using BPTT
         gparams = []
         for param in self.rnn.params:
-            gparam = T.grad(cost, param)
+            gparam = T.minimum(T.grad(cost, param), self.grad_max)
             gparams.append(gparam)
 
         updates = {}
@@ -430,6 +449,11 @@ class MetaRNN(BaseEstimator):
                     # compute loss on training set
                     train_losses = [compute_train_error(i)
                                     for i in xrange(n_train)]
+
+                    if self.rnn.output_type == 'softmax':
+                        train_out = [train_losses[i][1] for i in xrange(n_train)]
+                        train_losses = [train_losses[i][0] for i in xrange(n_train)]
+                        this_train_accuracy = np.mean(train_out)
                     this_train_loss = np.mean(train_losses)
 
                     if self.interactive:
@@ -442,10 +466,18 @@ class MetaRNN(BaseEstimator):
                         (epoch, idx + 1, n_train,
                          this_train_loss, this_test_loss, self.learning_rate))
                     else:
-                        logger.info('epoch %i, seq %i/%i, train loss %f '
-                                    'lr: %f' % \
-                                    (epoch, idx + 1, n_train, this_train_loss,
-                                     self.learning_rate))
+                        if self.output_type == 'softmax':
+                            print this_train_accuracy
+                            logger.info('epoch %i, seq %i/%i, train loss %f '
+                                                        'accuracy: %f '
+                                                        'lr: %f' % \
+                                                        (epoch, idx + 1, n_train, this_train_loss, this_train_accuracy,
+                                                         self.learning_rate))
+                        else:
+                            logger.info('epoch %i, seq %i/%i, train loss %f '
+                                        'lr: %f' % \
+                                        (epoch, idx + 1, n_train, this_train_loss,
+                                         self.learning_rate))
 
             self.learning_rate *= self.learning_rate_decay
 
@@ -471,10 +503,11 @@ def test_real():
 
     model = MetaRNN(n_in=n_in, n_hidden=n_hidden, n_out=n_out,
                     learning_rate=0.001, learning_rate_decay=0.999,
-                    n_epochs=400, activation='tanh')
+                    n_epochs=400, activation='relu')
 
     model.fit(seq, targets, validation_frequency=1000)
 
+    '''
     plt.close('all')
     fig = plt.figure()
     ax1 = plt.subplot(211)
@@ -489,6 +522,7 @@ def test_real():
     for i, x in enumerate(guessed_targets):
         x.set_color(true_targets[i].get_color())
     ax2.set_title('solid: true output, dashed: model output')
+    '''
 
 
 def test_binary(multiple_out=False, n_epochs=250):
@@ -593,12 +627,124 @@ def test_softmax(n_epochs=250):
                                    cmap='gray')
         ax2.set_title('blue: true class, grayscale: probs assigned by model')
 
+def test_softmax2(n_epochs=250):
+    """ Test RNN with a single softmax output after the sequence. """
+    n_hidden = 20
+    n_in = 1
+    n_steps = 50
+    n_classes = 4
+    n_seq = 100*n_classes
+    n_out = n_classes  # restricted to single softmax per time step
+
+    np.random.seed(0)
+    # simple distribution test
+    seq = np.zeros((n_seq, n_steps, n_in))
+    eachSize = (n_seq/n_classes, n_steps, 1)
+    seq[:n_seq/n_classes] = np.random.uniform(0,1,eachSize) # uniform positive
+    seq[n_seq/n_classes:2*n_seq/n_classes] = np.random.uniform(-1,0,eachSize) # uniform negativ
+    seq[2*n_seq/n_classes:3*n_seq/n_classes] = np.random.uniform(1,2,eachSize) # uniform [1,2]
+    seq[3*n_seq/n_classes:] = np.random.gamma(shape=1.0, size=eachSize) # gamma (mostly between 0 and 3)
+
+    targets = np.repeat(np.asarray(range(n_classes)), n_seq/n_classes)
+    targets = np.expand_dims(targets, axis=1)
+
+    d = zip(seq, targets)
+    random.shuffle(d)
+    seq = np.asarray([i[0] for i in d])
+    targets = np.asarray([i[1] for i in d])
+
+    model = MetaRNN(n_in=n_in, n_hidden=n_hidden, n_out=n_out,
+                    learning_rate=0.000001, learning_rate_decay=0.999,
+                    n_epochs=n_epochs, activation='relu', grad_max=1,
+                    output_type='softmax', use_symbolic_softmax=False, only_output_after=True)
+
+    model.fit(seq, targets, validation_frequency=1000)
+
+    seqs = xrange(10)
+
+    plt.close('all')
+    for seq_num in seqs:
+        fig = plt.figure()
+        ax1 = plt.subplot(211)
+        plt.plot(seq[seq_num])
+        ax1.set_title('input')
+        ax2 = plt.subplot(212)
+
+        # blue line will represent true classes
+        true_targets = plt.step(xrange(n_steps), targets[seq_num], marker='o')
+
+        # show probabilities (in b/w) output by model
+        guess = model.predict_proba(seq[seq_num])
+        guessed_probs = plt.imshow(guess.T, interpolation='nearest',
+                                   cmap='gray')
+        ax2.set_title('blue: true class, grayscale: probs assigned by model')
+
+
+def load_data_np(datafile):
+    print '... loading data'
+
+    # Load the dataset
+    with open(datafile) as f:
+        [tr, val, tst] = pickle.load(f)
+
+    return tr[0], tr[1]
+
+
+
+def test_mnist(n_epochs=250):
+    """ Test RNN with softmax outputs on the mnist data set. """
+    n_hidden = 100
+    n_in = 1
+    n_steps = 784
+    n_classes = 10
+    n_out = n_classes  # restricted to single softmax per time step
+
+    np.random.seed(0)
+
+    # load mnist
+    from os.path import expanduser
+    home = expanduser("~")
+    seq, y = load_data_np(home+"/datasets/mnistSMALL.pkl")
+    seq = np.expand_dims(seq, axis=2)
+    #seq, y = seq[:100], y[:100]
+    n_seq = len(seq)
+
+    targets = np.expand_dims(y, axis=1) #np.zeros((n_seq, n_classes), dtype=np.int)
+    #targets[np.arange(len(y)), y]= 1
+
+    model = MetaRNN(n_in=n_in, n_hidden=n_hidden, n_out=n_out,
+                    learning_rate=0.0001, learning_rate_decay=0.999,
+                    n_epochs=n_epochs, activation='relu',
+                    output_type='softmax', use_symbolic_softmax=False,only_output_after=True)
+
+    model.fit(seq, targets, validation_frequency=1000)
+
+    seqs = xrange(10)
+
+    plt.close('all')
+    for seq_num in seqs:
+        fig = plt.figure()
+        ax1 = plt.subplot(211)
+        plt.plot(seq[seq_num])
+        ax1.set_title('input')
+        ax2 = plt.subplot(212)
+
+        # blue line will represent true classes
+        true_targets = plt.step(xrange(n_steps), targets[seq_num], marker='o')
+
+        # show probabilities (in b/w) output by model
+        guess = model.predict_proba(seq[seq_num])
+        guessed_probs = plt.imshow(guess.T, interpolation='nearest',
+                                   cmap='gray')
+        ax2.set_title('blue: true class, grayscale: probs assigned by model')
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     t0 = time.time()
-    test_real()
+    #test_real()
     # problem takes more epochs to solve
     #test_binary(multiple_out=True, n_epochs=2400)
-    #test_softmax(n_epochs=250)
+    test_softmax2(n_epochs=500)
+    #test_mnist(n_epochs=100)
     print "Elapsed time: %f" % (time.time() - t0)
