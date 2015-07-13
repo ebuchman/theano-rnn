@@ -12,6 +12,7 @@ import time
 import os
 import datetime
 import cPickle as pickle
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +33,13 @@ class RNN(object):
 
     """
     def __init__(self, input, n_in, n_hidden, n_out, activation=T.tanh,
-                 output_type='real'):
+                 output_type='real', only_output_after=False):
 
         self.input = input
         self.activation = activation
         self.output_type = output_type
 
+        self.only_output_after = only_output_after
         self.batch_size = T.iscalar()
 
         # theta is a vector of all trainable parameters
@@ -54,9 +56,10 @@ class RNN(object):
         self.W = self.theta[param_idx:(param_idx + n_hidden ** 2)].reshape(
             (n_hidden, n_hidden))
         self.W.name = 'W'
-        W_init = np.asarray(np.random.uniform(size=(n_hidden, n_hidden),
+        '''W_init = np.asarray(np.random.uniform(size=(n_hidden, n_hidden),
                                               low=-0.01, high=0.01),
-                                              dtype=theano.config.floatX)
+                                              dtype=theano.config.floatX)'''
+        W_init = np.identity(n_hidden, dtype=theano.config.floatX)
         param_idx += n_hidden ** 2
 
         # input to hidden layer weights
@@ -133,6 +136,11 @@ class RNN(object):
                     # outputs_info=[T.ones(shape=(self.input.shape[1],
                     # self.h0.shape[0])) * self.h0, None])
 
+        # sometimes we only care about the final output
+		# a matrix (batch_size, n_out)
+        if only_output_after:
+            self.y_pred = self.y_pred[-1]
+
         # L1 norm ; one regularization option is to enforce L1 norm to
         # be small
         self.L1 = 0
@@ -162,10 +170,13 @@ class RNN(object):
             # We take our n_steps x n_seq x n_classes output from the net
             # and reshape it into a (n_steps * n_seq) x n_classes matrix
             # apply softmax, then reshape back
-            y_p = self.y_pred
-            y_p_m = T.reshape(y_p, (y_p.shape[0] * y_p.shape[1], -1))
-            y_p_s = T.nnet.softmax(y_p_m)
-            self.p_y_given_x = T.reshape(y_p_s, y_p.shape)
+            if self.only_output_after:
+                self.p_y_given_x = T.nnet.softmax(self.y_pred)
+            else:
+                y_p = self.y_pred
+                y_p_m = T.reshape(y_p, (y_p.shape[0] * y_p.shape[1], -1))
+                y_p_s = T.nnet.softmax(y_p_m)
+                self.p_y_given_x = T.reshape(y_p_s, y_p.shape)
 
             # compute prediction as class whose probability is maximal
             self.y_out = T.argmax(self.p_y_given_x, axis=-1)
@@ -192,10 +203,13 @@ class RNN(object):
         # correspond to the true class)
         # the labels y also must be flattened when we do this to use the
         # advanced indexing
-        p_y = self.p_y_given_x
-        p_y_m = T.reshape(p_y, (p_y.shape[0] * p_y.shape[1], -1))
-        y_f = y.flatten(ndim=1)
-        return -T.mean(T.log(p_y_m)[T.arange(p_y_m.shape[0]), y_f])
+        if self.only_output_after:
+            return -T.mean(T.log(self.p_y_given_x)[T.arange(y.shape[0]), y])
+        else:
+            p_y = self.p_y_given_x
+            p_y_m = T.reshape(p_y, (p_y.shape[0] * p_y.shape[1], -1))
+            y_f = y.flatten(ndim=1)
+            return -T.mean(T.log(p_y_m)[T.arange(p_y_m.shape[0]), y_f])
 
     def errors(self, y):
         """Return a float representing the number of errors in the minibatch
@@ -208,6 +222,7 @@ class RNN(object):
         """
 
         # check if y has same dimension of y_pred
+        print "ydims", y.ndim, self.y_out.ndim
         if y.ndim != self.y_out.ndim:
             raise TypeError('y should have the same shape as self.y_out',
                 ('y', y.type, 'y_out', self.y_out.type))
@@ -226,6 +241,8 @@ class MetaRNN(BaseEstimator):
                  learning_rate_decay=1,
                  activation='tanh', output_type='real', final_momentum=0.9,
                  initial_momentum=0.5, momentum_switchover=5,
+                                 grad_max=10,
+                                 only_output_after=False,
                  snapshot_every=None, snapshot_path='/tmp'):
         self.n_in = int(n_in)
         self.n_hidden = int(n_hidden)
@@ -241,6 +258,8 @@ class MetaRNN(BaseEstimator):
         self.initial_momentum = float(initial_momentum)
         self.final_momentum = float(final_momentum)
         self.momentum_switchover = int(momentum_switchover)
+        self.grad_max = grad_max
+        self.only_output_after = only_output_after
         if snapshot_every is not None:
             self.snapshot_every = int(snapshot_every)
         else:
@@ -258,7 +277,10 @@ class MetaRNN(BaseEstimator):
         elif self.output_type == 'binary':
             self.y = T.tensor3(name='y', dtype='int32')
         elif self.output_type == 'softmax':  # now it is a matrix (T x n_seq)
-            self.y = T.matrix(name='y', dtype='int32')
+            if self.only_output_after:
+                self.y = T.vector(name='y', dtype='int32')
+            else:
+                self.y = T.matrix(name='y', dtype='int32')
         else:
             raise NotImplementedError
 
@@ -278,7 +300,8 @@ class MetaRNN(BaseEstimator):
 
         self.rnn = RNN(input=self.x, n_in=self.n_in,
                        n_hidden=self.n_hidden, n_out=self.n_out,
-                       activation=activation, output_type=self.output_type)
+                       activation=activation, output_type=self.output_type,
+                                           only_output_after=self.only_output_after)
 
         if self.output_type == 'real':
             self.predict = theano.function(inputs=[self.x, ],
@@ -450,9 +473,11 @@ class MetaRNN(BaseEstimator):
         l_r = T.scalar('l_r', dtype=theano.config.floatX)
         mom = T.scalar('mom', dtype=theano.config.floatX)  # momentum
 
+        print "building cost graph"
         cost = self.rnn.loss(self.y) \
             + self.L1_reg * self.rnn.L1 \
             + self.L2_reg * self.rnn.L2_sqr
+        print "cost done"
 
         # Proper implementation of variable-batch size evaluation
         # Note that classifier.errors() returns the mean error
@@ -469,31 +494,38 @@ class MetaRNN(BaseEstimator):
         get_batch_size = theano.function(inputs=[index, n_ex],
                                           outputs=effective_batch_size)
 
+        def symbY(sharedY, start, stop, final_only):
+		    if final_only:
+		        return sharedY[batch_start:batch_stop]
+		    else:
+		        return sharedY[:, batch_start:batch_stop]
+        print "compute train error"
         compute_train_error = theano.function(inputs=[index, n_ex],
             outputs=self.rnn.loss(self.y),
             givens={self.x: train_set_x[:, batch_start:batch_stop],
-                    self.y: train_set_y[:, batch_start:batch_stop]},
+                                self.y: symbY(train_set_y, batch_start, batch_stop, self.only_output_after)},
             mode=mode)
+        print "done compute train error"
 
         if compute_zero_one:
             compute_train_zo = theano.function(inputs=[index, n_ex],
             outputs=self.rnn.errors(self.y),
             givens={self.x: train_set_x[:, batch_start:batch_stop],
-                    self.y: train_set_y[:, batch_start:batch_stop]},
+                                self.y: symbY(train_set_y, batch_start, batch_stop, self.only_output_after)},
             mode=mode)
 
         if self.interactive:
             compute_test_error = theano.function(inputs=[index, n_ex],
                 outputs=self.rnn.loss(self.y),
                 givens={self.x: test_set_x[:, batch_start:batch_stop],
-                        self.y: test_set_y[:, batch_start:batch_stop]},
+                                self.y: symbY(test_set_y, batch_start, batch_stop, self.only_output_after)},
                 mode=mode)
 
             if compute_zero_one:
                 compute_test_zo = theano.function(inputs=[index, n_ex],
                     outputs=self.rnn.errors(self.y),
                     givens={self.x: test_set_x[:, batch_start:batch_stop],
-                            self.y: test_set_y[:, batch_start:batch_stop]},
+                                self.y: symbY(test_set_y, batch_start, batch_stop, self.only_output_after)},
                             mode=mode)
 
         self.get_norms = {}
@@ -524,7 +556,7 @@ class MetaRNN(BaseEstimator):
                 outputs=cost,
                 updates=updates,
                 givens={self.x: train_set_x[:, batch_start:batch_stop],
-                        self.y: train_set_y[:, batch_start:batch_stop]},
+                        self.y: symbY(train_set_y,batch_start,batch_stop,self.only_output_after)},
                 mode=mode)
 
             ###############
@@ -549,7 +581,7 @@ class MetaRNN(BaseEstimator):
                     iter = (epoch - 1) * n_train_batches + minibatch_idx + 1
 
                     if iter % validation_frequency == 0:
-                        # compute loss on training set
+            # compute loss on training set
                         train_losses = [compute_train_error(i, n_train)
                                         for i in xrange(n_train_batches)]
                         train_batch_sizes = [get_batch_size(i, n_train)
@@ -637,7 +669,7 @@ class MetaRNN(BaseEstimator):
             batch_cost = theano.function(inputs=[index, n_ex],
                 outputs=cost,
                 givens={self.x: train_set_x[:, batch_start:batch_stop],
-                        self.y: train_set_y[:, batch_start:batch_stop]},
+						self.y: symbY(train_set_y, batch_start, batch_stop, self.only_output_after)},
                 mode=mode, name="batch_cost")
 
             # compile a theano function that returns the gradient of the
@@ -645,7 +677,7 @@ class MetaRNN(BaseEstimator):
             batch_grad = theano.function(inputs=[index, n_ex],
                 outputs=T.grad(cost, self.rnn.theta),
                 givens={self.x: train_set_x[:, batch_start:batch_stop],
-                        self.y: train_set_y[:, batch_start:batch_stop]},
+						self.y: symbY(train_set_y, batch_start, batch_stop, self.only_output_after)},
                 mode=mode, name="batch_grad")
 
             # creates a function that computes the average cost on the training
@@ -807,7 +839,7 @@ def test_real(n_epochs=1000):
                     n_epochs=n_epochs, batch_size=n_seq, activation='tanh',
                     L2_reg=1e-3)
 
-    model.fit(seq, targets, validate_every=100, optimizer='bfgs')
+    model.fit(seq, targets, validate_every=100, optimizer='sgd')
 
     plt.close('all')
     fig = plt.figure()
@@ -908,7 +940,7 @@ def test_softmax(n_epochs=250, optimizer='cg'):
 
     model = MetaRNN(n_in=n_in, n_hidden=n_hidden, n_out=n_out,
                     learning_rate=0.005, learning_rate_decay=0.999,
-                    n_epochs=n_epochs, batch_size=n_seq, activation='tanh',
+                    n_epochs=n_epochs, batch_size=n_seq, activation='relu',
                     output_type='softmax')
 
     model.fit(seq, targets, validate_every=10, compute_zero_one=True,
@@ -934,11 +966,115 @@ def test_softmax(n_epochs=250, optimizer='cg'):
                                    cmap='gray')
         ax2.set_title('blue: true class, grayscale: probs assigned by model')
 
+def test_softmax2(n_epochs=250, optimizer='sgd'):
+    """ Test RNN with a single softmax output after the sequence. """
+    n_hidden = 50
+    n_in = 1
+    n_steps = 50
+    n_classes = 4
+    batch_size = 10
+    n_seq=100*n_classes
+    n_out = n_classes  # restricted to single softmax per time step
+
+    np.random.seed(0)
+    # simple distributions test
+    seq = np.zeros((n_seq, n_steps, n_in))
+    eachSize = (n_seq/n_classes, n_steps, 1)
+    seq[:n_seq/n_classes] = np.random.uniform(0,1,eachSize) # uniform positive
+    seq[n_seq/n_classes:2*n_seq/n_classes] = np.random.uniform(-1,0,eachSize) # uniform negativ
+    seq[2*n_seq/n_classes:3*n_seq/n_classes] = np.random.uniform(1,2,eachSize) # uniform [1,2]
+    seq[3*n_seq/n_classes:] = np.random.gamma(shape=1.0, size=eachSize) # gamma (mostly between 0 and 3)
+
+    targets = np.repeat(np.asarray(range(n_classes)), n_seq/n_classes)
+    #targets = np.expand_dims(targets, axis=1)
+
+    print seq.shape, targets.shape
+
+    d = zip(seq, targets)
+    random.shuffle(d)
+    seq = np.asarray([i[0] for i in d])
+    targets = np.asarray([i[1] for i in d])
+
+    print seq.shape, targets.shape
+
+    seq = seq.transpose(1,0,2)
+    #targets = targets.transpose(1,0)
+    print seq.shape, targets.shape
+
+    model = MetaRNN(n_in=n_in, n_hidden=n_hidden, n_out=n_out,
+                    learning_rate=0.00001, batch_size=batch_size, learning_rate_decay=0.999,
+                    n_epochs=n_epochs, activation='relu', grad_max=10,
+                    output_type='softmax', only_output_after=True)
+
+    model.fit(seq, targets, validate_every=10, compute_zero_one=True)
+
+    seqs = xrange(10)
+
+    plt.close('all')
+    for seq_num in seqs:
+        fig = plt.figure()
+        ax1 = plt.subplot(211)
+        plt.plot(seq[seq_num])
+        ax1.set_title('input')
+        ax2 = plt.subplot(212)
+
+        # blue line will represent true classes
+        true_targets = plt.step(xrange(n_steps), targets[seq_num], marker='o')
+
+        # show probabilities (in b/w) output by model
+        guess = model.predict_proba(seq[seq_num])
+        guessed_probs = plt.imshow(guess.T, interpolation='nearest',
+                                   cmap='gray')
+        ax2.set_title('blue: true class, grayscale: probs assigned by model')
+
+
+def load_data_np(datafile):
+    print '... loading data'
+
+    # Load the dataset
+    with open(datafile) as f:
+        [tr, val, tst] = pickle.load(f)
+
+    return tr[0], tr[1]
+
+
+def test_mnist(n_epochs=250, optimizer='sgd'):
+    """ Test RNN with softmax outputs on the mnist data set. """
+    n_hidden = 100
+    n_in = 1
+    n_steps = 784
+    n_classes = 10
+    batch_size = 20
+    n_out = n_classes  # restricted to single softmax per time step
+
+    np.random.seed(0)
+
+    # load mnist
+    from os.path import expanduser
+    home = expanduser("~")
+    seq, y = load_data_np(home+"/datasets/mnistSMALL.pkl")
+    seq = np.expand_dims(seq, axis=2)
+    #seq, y = seq[:100], y[:100]
+    n_seq = len(seq)
+
+    # steps first for ungodly reasons
+    seq = seq.transpose(1,0,2)
+    targets = y 
+
+    model = MetaRNN(n_in=n_in, n_hidden=n_hidden, n_out=n_out,
+                    learning_rate=0.0000001, batch_size=batch_size, learning_rate_decay=0.999,
+                    n_epochs=n_epochs, activation='relu', grad_max=10,
+                    output_type='softmax', only_output_after=True)
+
+    model.fit(seq, targets, validate_every=10, compute_zero_one=True)
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     t0 = time.time()
-    test_real(n_epochs=1000)
+    #test_real(n_epochs=1000)
     #test_binary(optimizer='sgd', n_epochs=1000)
-    #test_softmax(n_epochs=250, optimizer='sgd')
+    #test_softmax(n_epochs=500, optimizer='sgd')
+    #test_softmax2(n_epochs=500, optimizer='sgd')
+    test_mnist(n_epochs=500, optimizer='sgd')
     print "Elapsed time: %f" % (time.time() - t0)
